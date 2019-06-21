@@ -173,7 +173,10 @@ class COMMAND:
 
     def run(self):
         'Run this command + arguments'
-        run(self.argslist)
+        try:
+            subprocess.Popen(self.argslist)
+        except Exception as e:
+            print(str(e), file=sys.stderr)
 
     def __str__(self):
         'Return string representation'
