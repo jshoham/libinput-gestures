@@ -66,19 +66,22 @@ def open_lock(*args):
 
     return fp
 
-def run(cmd, check=True):
-    'Run subprocess function and return standard output or None'
+def run(cmd, *, check=True, block=True):
+    'Run function and return standard output, Popen() handle, or None'
     # Maintain subprocess compatibility with python 3.4 so use
     # check_output() rather than run().
     try:
-        stdout = subprocess.check_output(cmd, universal_newlines=True,
-                stderr=(None if check else subprocess.DEVNULL))
+        if block:
+            result = subprocess.check_output(cmd, universal_newlines=True,
+                    stderr=(None if check else subprocess.DEVNULL))
+        else:
+            result = subprocess.Popen(cmd)
     except Exception as e:
-        stdout = None
+        result = None
         if check:
             print(str(e), file=sys.stderr)
 
-    return stdout
+    return result
 
 def get_libinput_vers():
     'Return the libinput installed version number string'
@@ -173,10 +176,7 @@ class COMMAND:
 
     def run(self):
         'Run this command + arguments'
-        try:
-            subprocess.Popen(self.argslist)
-        except Exception as e:
-            print(str(e), file=sys.stderr)
+        run(self.argslist, block=False)
 
     def __str__(self):
         'Return string representation'
@@ -251,7 +251,7 @@ class COMMAND_internal(COMMAND):
 
         # Switch to desired workspace
         if index >= minindex and index < maxindex:
-            run(('wmctrl', '-s', str(index)))
+            run(('wmctrl', '-s', str(index)), block=False)
 
 # Table of gesture handlers
 handlers = OrderedDict()
@@ -533,7 +533,8 @@ if args.verbose:
         print('Gestures configured in {}:'.format(confname))
         for h in handlers.values():
             for mpair, cmd in h.motions.items():
-                motion, fingers = (mpair, '') if isinstance(mpair, str) else mpair
+                motion, fingers = (mpair, '') \
+                        if isinstance(mpair, str) else mpair
                 print('{} {:10}{:>2} {}'.format(h.name.lower(), motion,
                     fingers, cmd))
 
