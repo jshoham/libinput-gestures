@@ -2,10 +2,12 @@
 'Read gestures from libinput touchpad and action shell commands.'
 # Mark Blakeney, Sep 2015
 import os, sys, argparse, subprocess, shlex, re, getpass, fcntl, platform, math
+import gi
 from time import monotonic
 from collections import OrderedDict
 from pathlib import Path
 from distutils.version import LooseVersion as Version
+from gi.repository import Gio
 
 PROGPATH = Path(sys.argv[0])
 PROGNAME = PROGPATH.stem
@@ -165,6 +167,56 @@ def get_device(name):
     # Give up
     return None
 
+# Set of all configured contexts
+conf_contexts = {'_general'}
+
+class ContextMatcher:
+    'Allow interaction with the Gnome Shell to get current context'
+    NAME        = 'org.gnome.Shell'
+    OBJPATH     = '/org/gnome/Shell'
+    IFACENAME   = 'org.freedesktop.DBus.Properties'
+    
+    # Currently supported internal contexts
+    contexts = (
+        '_general',
+        '_overview',
+    )
+
+    app_cache = {}
+
+    def __init__(self):
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self.proxy = Gio.DBusProxy.new_sync(self.bus, 
+                Gio.DBusProxyFlags.NONE, None, self.NAME, self.OBJPATH,
+                self.IFACENAME, None)
+            self.connected = True
+        except:
+            self.connected = False
+            if args.debug:
+                print('Failed to connect to Gnome Shell DBus: {}'.format(
+                    sys.exec_info()[1]))
+
+    def get_overview_state(self):
+        if self.connected:
+            return self.proxy.Get('(ss)', self.NAME, 'OverviewActive')
+        else:
+            return False
+
+    def get_active_appname(self):
+        #TODO
+        return '_general'
+
+    def get_active_context(self):
+        if self.get_overview_state():
+            return '_overview'
+        else:
+            return self.get_active_appname()
+
+        
+
+GnomeShell = ContextMatcher()
+
 class COMMAND:
     'Generic command handler'
     def __init__(self, args):
@@ -268,7 +320,7 @@ class GESTURE:
         self.motions = OrderedDict()
         self.has_extended = False
 
-    def add(self, motion, fingers, command):
+    def add(self, context, motion, fingers, command):
         'Add a configured motion command for this gesture'
         if motion not in self.SUPPORTED_MOTIONS:
             return 'Gesture {} does not support motion "{}".\n' \
@@ -282,7 +334,7 @@ class GESTURE:
         if self.extended_text in motion:
             self.has_extended = True
 
-        key = (motion, fingers) if fingers else motion
+        key = (context, motion, fingers)
 
         try:
             cmds = shlex.split(command)
@@ -301,14 +353,19 @@ class GESTURE:
 
     def action(self, motion):
         'Action a motion command for this gesture'
-        command = self.motions.get((motion, self.fingers)) or \
-                self.motions.get(motion)
+        context = GnomeShell.get_active_context()
+        command = self.motions.get((context, motion, self.fingers)) or \
+                self.motions.get((context, motion, None)) or \
+                self.motions.get(('_general', motion, self.fingers)) or \
+                self.motions.get(('_general', motion, None))
 
         if args.verbose:
-            print('{}: {} {} {} {}'.format(PROGNAME, self.name, motion,
-                self.fingers, self.data))
+            print('{}: [{}] {} {} {} {}'.format(PROGNAME, context, self.name, 
+                motion, self.fingers, self.data))
             if command:
                 print('  ', command)
+            else:
+                print('   no command')
 
         if timeoutv > 0 and (self.starttime + timeoutv) < monotonic():
             if args.verbose:
@@ -396,9 +453,10 @@ conf_commands = OrderedDict()
 def add_conf_command(func):
     'Add configuration command to command lookup table based on name'
     conf_commands[re.sub('^conf_', '', func.__name__)] = func
+    return func
 
 @add_conf_command
-def conf_gesture(lineargs):
+def conf_gesture(lineargs, context):
     'Process a single gesture line in conf file'
     fields = lineargs.split(maxsplit=2)
 
@@ -422,7 +480,7 @@ def conf_gesture(lineargs):
         fingers = None
 
     # Add the configured gesture
-    return handler.add(motion.lower(), fingers, command)
+    return handler.add(context, motion.lower(), fingers, command)
 
 @add_conf_command
 def conf_device(lineargs):
@@ -455,7 +513,7 @@ def timeout(lineargs):
 
     return None if timeoutv >= 0 else 'Must be >= 0'
 
-def get_conf_line(line):
+def get_conf_line(line, contexts):
     'Process a single line in conf file'
     key, *argslist = line.split(maxsplit=1)
 
@@ -467,17 +525,48 @@ def get_conf_line(line):
         return 'Configuration command "{}" is not supported.\n' \
                 'Must be "{}"'.format(key, '" or "'.join(conf_commands))
 
-    return conf_func(argslist[0] if argslist else '')
+    # Configure the gesture for each context
+    if conf_func is conf_gesture:
+        if args.debug:
+            print('Adding gesture {} {}'.format(contexts, argslist[0] if
+                argslist else ''))
+        errmsg = ''
+        for c in contexts:
+            errmsg = conf_func(argslist[0] if argslist else '', c)
+            if errmsg: return errmsg
+    else:
+        return conf_func(argslist[0] if argslist else '')
 
 def get_conf(conffile, confname):
     'Read given configuration file and store internal actions etc'
     with conffile.open() as fp:
+        contexts = []
+        context_mode = False
+
         for num, line in enumerate(fp, 1):
             line = line.strip()
             if not line or line[0] == '#':
                 continue
 
-            errmsg = get_conf_line(line)
+            if line[0] == '[':
+                contexts.clear()
+                contexts.append(line[1:-1].strip().lower())
+                context_mode = True
+                continue
+
+            if line[0] == ';':
+                if context_mode:
+                    contexts.append(line[2:-1].strip().lower())
+                    continue
+                else:
+                    errmsg = 'Grouped contexts must be contiguous'
+
+            else:
+                conf_contexts.update(contexts)
+                context_mode = False
+                errmsg = get_conf_line(line, contexts if contexts 
+                    else ['_general'])
+
             if errmsg:
                 sys.exit('Error at line {} in file {}:\n>> {} <<\n{}.'.format(
                     num, confname, line, errmsg))
@@ -531,12 +620,17 @@ get_conf(conffile, confname)
 if args.verbose:
     if not args.raw:
         print('Gestures configured in {}:'.format(confname))
+        ctx_w = len(max(conf_contexts, key=len))
         for h in handlers.values():
             for mpair, cmd in h.motions.items():
-                motion, fingers = (mpair, '') \
-                        if isinstance(mpair, str) else mpair
-                print('{} {:10}{:>2} {}'.format(h.name.lower(), motion,
-                    fingers, cmd))
+                if len(mpair) == 2:
+                    context, motion = mpair
+                    fingers = ''
+                else:
+                    context, motion, fingers = mpair
+                print('{:{w}}{} {:10}{:>2} {}'.format('['+context+']' if context 
+                    else '', h.name.lower(), motion, fingers, cmd,
+                    w=ctx_w+3))
 
         if swipe_min_threshold:
             print('swipe_threshold {}'.format(swipe_min_threshold))
